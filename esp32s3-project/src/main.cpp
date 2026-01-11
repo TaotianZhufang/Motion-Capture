@@ -1,5 +1,11 @@
 #include <SPI.h>
 #include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <WiFiServer.h>
+#include <WiFiUdp.h>
+#include "Bmi323Config.h"
+
 
 //BMI1 FSPI
 #define BMI1_MISO 9
@@ -36,18 +42,29 @@ SPIClass spi2(HSPI); //BMI2
 
 //常量配置
 #define SPI_FREQ 1000000
-#define OUTPUT_RATE_HZ 20
+#define OUTPUT_RATE_HZ 100
 #define ACC_RANGE_LSB_PER_16G 2048.0
 #define GYR_RANGE_LSB_PER_2000DPS 16.384
 #define SOFT_RESET_CMD 0xDEAF
 #define ACC_CONF_NORMAL_100HZ_16G 0x4038
 #define GYR_CONF_NORMAL_100HZ_2000DPS 0x4048
+#define ACC_RANGE_2G_LSB_PER_G    16384.0
+#define GYR_RANGE_125DPS_LSB_PER_DPS   262.144
+#define ACC_CONF_NORMAL_100HZ_2G_LSB_PER_G 16384.0
+#define GYR_CONF_NORMAL_100HZ_125DPS_LSB_PER_DPS 262.144
+#define GYR_CONF_NORMAL_100HZ_125DPS     0x4008 
+#define ACC_CONF_NORMAL_100HZ_2G         0x4008  
 
 //Settings For BMI323 More In Bmi323Config.h
-#define ACC_RANGE_LSB_PER_G ACC_RANGE_LSB_PER_16G
-#define GYR_RANGE_LSB_PER_DPS GYR_RANGE_LSB_PER_2000DPS
-#define ACC_CONF_NORMAL_HZ_G ACC_CONF_NORMAL_100HZ_16G
-#define GYR_CONF_NORMAL_HZ_DPS GYR_CONF_NORMAL_100HZ_2000DPS
+#define ACC_RANGE_LSB_PER_G ACC_CONF_NORMAL_400HZ_2G_LSB_PER_G
+#define GYR_RANGE_LSB_PER_DPS GYR_CONF_NORMAL_400HZ_125DPS_LSB_PER_DPS
+#define ACC_CONF_NORMAL_HZ_G ACC_CONF_NORMAL_400HZ_2G
+#define GYR_CONF_NORMAL_HZ_DPS GYR_CONF_NORMAL_400HZ_125DPS 
+//2
+#define ACC_RANGE_LSB_PER_G2 ACC_CONF_NORMAL_400HZ_2G_LSB_PER_G
+#define GYR_RANGE_LSB_PER_DPS2 GYR_CONF_NORMAL_400HZ_500DPS_LSB_PER_DPS
+#define ACC_CONF_NORMAL_HZ_G2 ACC_CONF_NORMAL_400HZ_2G
+#define GYR_CONF_NORMAL_HZ_DPS2 GYR_CONF_NORMAL_400HZ_500DPS 
 
 // System constants
 #define deltat 0.05f                                    // sampling period in seconds (shown as 1 ms)
@@ -62,6 +79,65 @@ SPIClass spi2(HSPI); //BMI2
 #define G			      9.7970f		        	//m/s^2
 #define RadtoDeg    57.324841f				//弧度到角度 (弧度 * 180/3.1415)
 #define DegtoRad    0.0174533f				//角度到弧度 (角度 * 3.1415/180)
+
+int count=0;
+
+const char *ssid = "0";
+const char *password = "98989898";
+
+const char* serverIP = "192.168.197.105";
+const int serverPort = 8888;         
+
+// 电脑的 IP 地址
+const char* udpAddress = "192.168.197.105"; 
+// 电脑监听的端口
+const int udpPort = 8888;
+WiFiUDP udp;
+ 
+WiFiClient client;
+#include <math.h>
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846f
+#endif
+
+#define RAD_TO_DEG (180.0f / M_PI)
+
+/**
+ * @brief 由加速度求单个传感器俯仰角 Pitch
+ * @param ax, ay, az  三轴加速度（单位一致即可，g 或 m/s² 都行）
+ * @return 俯仰角，单位：度
+ */
+float Accel_CalcPitchDeg(float ax, float ay, float az)
+{
+    /* YZ 平面投影长度 */
+    float yz = sqrtf(ay * ay + az * az);
+
+    /* 防止除 0 */
+    if (yz < 1e-6f)
+        return 0.0f;
+
+    /* Pitch = atan2(-Ax, sqrt(Ay² + Az²)) */
+    float pitch_rad = atan2f(-ax, yz);
+
+    return pitch_rad * RAD_TO_DEG;
+}
+
+/**
+ * @brief 由两个加速度计姿态求柔性 PCB 弯曲角
+ * @return 弯曲角绝对值，单位：度
+ */
+float Accel_CalcBendingDeg(float ax1, float ay1, float az1,
+                           float ax2, float ay2, float az2)
+{
+    float p1 = Accel_CalcPitchDeg(ax1, ay1, az1);
+    float p2 = Accel_CalcPitchDeg(ax2, ay2, az2);
+
+    float delta = p1 - p2;
+    if (delta < 0) delta = -delta;
+
+    return delta;
+}
 
 // Global system variables
 float a_x, a_y, a_z;
@@ -318,6 +394,14 @@ float convertGyroData(uint16_t rawData) {
   int16_t signedData = (int16_t)rawData;
   return signedData / GYR_RANGE_LSB_PER_DPS;
 }
+float convertAccelData2(uint16_t rawData) {
+  int16_t signedData = (int16_t)rawData;
+  return signedData / ACC_RANGE_LSB_PER_G2;
+}
+float convertGyroData2(uint16_t rawData) {
+  int16_t signedData = (int16_t)rawData;
+  return signedData / GYR_RANGE_LSB_PER_DPS2;
+}
 float convertTempData(uint16_t rawData) {
   int16_t signedData = (int16_t)rawData;
   return (signedData / 512.0) + 23.0;
@@ -339,18 +423,43 @@ bool initBMI323(SPIClass &spi, uint8_t cs) {
   delay(5);
 
   if (!initializeFeatureEngine(spi, cs)) return false;
-
+  if(cs==BMI1_CS)
+  {
   writeRegister16(spi, cs, ACC_CONF_REG, ACC_CONF_NORMAL_HZ_G);
   writeRegister16(spi, cs, GYR_CONF_REG, GYR_CONF_NORMAL_HZ_DPS);
+  }
+  else if (cs==BMI2_CS)
+  {
+    writeRegister16(spi, cs, ACC_CONF_REG, ACC_CONF_NORMAL_HZ_G2);
+  writeRegister16(spi, cs, GYR_CONF_REG, GYR_CONF_NORMAL_HZ_DPS2);
+  }
+  
   delay(50);
 
   return true;
+}
+void connectToServer() {
+  if (client.connect(serverIP, serverPort)) {
+    Serial.println("Connected to server!");
+  } else {
+    Serial.println("Connection failed!");
+  }
 }
 
 void setup() {
   Serial.begin(115200);
   delay(2000);
+   WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("WiFi connected");
+  Serial.println("IP address: " + WiFi.localIP().toString());
+  Serial.println("BroadcastIP:"+WiFi.broadcastIP().toString());
 
+  //connectToServer();
+  udp.begin(12345); 
   //BMI1
   pinMode(BMI1_CS, OUTPUT);
   digitalWrite(BMI1_CS, HIGH);
@@ -380,9 +489,11 @@ void setup() {
 }
 
 void loop() {
+    
   unsigned long currentTime = millis();
   if (currentTime - lastPrintTime < printInterval) return;
   lastPrintTime = currentTime;
+  count++;
   //BMI1
   uint16_t accX1 = readRegister16(spi1, BMI1_CS, ACC_DATA_X_REG);
   uint16_t accY1 = readRegister16(spi1, BMI1_CS, ACC_DATA_Y_REG);
@@ -400,26 +511,53 @@ void loop() {
   uint16_t gyrY2 = readRegister16(spi2, BMI2_CS, GYR_DATA_Y_REG);
   uint16_t gyrZ2 = readRegister16(spi2, BMI2_CS, GYR_DATA_Z_REG);
   uint16_t tempRaw2 = readRegister16(spi2, BMI2_CS, TEMP_DATA_REG);
-/*
-  //BMI1
-  Serial.print("BMI1,");
-  Serial.print(convertAccelData(accX1), 3); Serial.print(",");
-  Serial.print(convertAccelData(accY1), 3); Serial.print(",");
-  Serial.print(convertAccelData(accZ1), 3); Serial.print(",");
-  Serial.print(convertGyroData(gyrX1), 2); Serial.print(",");
-  Serial.print(convertGyroData(gyrY1), 2); Serial.print(",");
-  Serial.print(convertGyroData(gyrZ1), 2); Serial.print(",");
-  Serial.println(convertTempData(tempRaw1), 1);
+
+
+  float del=Accel_CalcBendingDeg(convertAccelData(accX1), convertAccelData(accY1), convertAccelData(accZ1),convertAccelData2(accX2), convertAccelData2(accY2),convertAccelData2(accZ2));
+
   
-  //BMI2
-  Serial.print("BMI2,");
-  Serial.print(convertAccelData(accX2), 3); Serial.print(",");
-  Serial.print(convertAccelData(accY2), 3); Serial.print(",");
-  Serial.print(convertAccelData(accZ2), 3); Serial.print(",");
-  Serial.print(convertGyroData(gyrX2), 2); Serial.print(",");
-  Serial.print(convertGyroData(gyrY2), 2); Serial.print(",");
-  Serial.print(convertGyroData(gyrZ2), 2); Serial.print(",");
-  Serial.println(convertTempData(tempRaw2), 1);*/
-  filterUpdate(convertGyroData(gyrX1)*Gyro_Gr, convertGyroData(gyrY1)*Gyro_Gr, convertGyroData(gyrZ1)*Gyro_Gr, convertAccelData(accX1), convertAccelData(accY1), convertAccelData(accZ1), 0, 0, 0);
-  Serial.print("BMI1:");Serial.print(SEq_1);Serial.print(",");Serial.print(SEq_2);Serial.print(",");Serial.print(SEq_3);Serial.print(",");Serial.println(SEq_4);
+
+char dataPacket[256]; 
+snprintf(dataPacket, sizeof(dataPacket), 
+  "%.2f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f\n",
+  
+  count/100.0,
+  convertAccelData(accX1), convertAccelData(accY1), convertAccelData(accZ1),
+  convertAccelData2(accX2), convertAccelData2(accY2), convertAccelData2(accZ2),
+  convertGyroData(gyrX1), 
+  convertGyroData(gyrY1), 
+  convertGyroData(gyrZ1),
+  convertGyroData2(gyrX2), 
+  convertGyroData2(gyrY2), 
+  convertGyroData2(gyrZ2),
+  del 
+);
+// 使用 snprintf 进行格式化打包
+// %.3f 表示浮点数保留3位小数，\r\n 表示换行
+/*
+snprintf(dataPacket, sizeof(dataPacket), 
+  "BMI1,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f\r\n"
+  "BMI2,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f\r\n"
+  "Angle:%.4f\r\n",
+  // BMI1 的参数
+  convertAccelData(accX1), convertAccelData(accY1), convertAccelData(accZ1),
+  convertGyroData(gyrX1),  convertGyroData(gyrY1),  convertGyroData(gyrZ1),
+  convertTempData(tempRaw1),
+  // BMI2 的参数
+  convertAccelData(accX2), convertAccelData(accY2), convertAccelData(accZ2),
+  convertGyroData(gyrX2),  convertGyroData(gyrY2),  convertGyroData(gyrZ2),
+  convertTempData(tempRaw2),
+  // Angle 参数 (注意：你原代码中 del 是发给 Serial 的，我这里把它也发给 Client 了)
+  del 
+);*/
+
+
+//client.print(dataPacket);
+udp.beginPacket(WiFi.broadcastIP(), udpPort); 
+  udp.print(dataPacket);            
+  udp.endPacket();                      
+
+//Serial.print(dataPacket); 
+  /*filterUpdate(convertGyroData(gyrX1)*Gyro_Gr, convertGyroData(gyrY1)*Gyro_Gr, convertGyroData(gyrZ1)*Gyro_Gr, convertAccelData(accX1), convertAccelData(accY1), convertAccelData(accZ1), 0, 0, 0);
+  Serial.print("BMI1:");Serial.print(SEq_1);Serial.print(",");Serial.print(SEq_2);Serial.print(",");Serial.print(SEq_3);Serial.print(",");Serial.println(SEq_4);*/
 }
